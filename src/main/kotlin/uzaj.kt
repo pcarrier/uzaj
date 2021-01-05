@@ -1,15 +1,13 @@
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.KotlinModule
-import com.google.cloud.spanner.PartitionOptions
 import com.google.cloud.spanner.Struct
 import graphql.language.*
 import graphql.parser.Parser
 import graphql.validation.DocumentVisitor
 import graphql.validation.LanguageTraversal
 import org.apache.beam.sdk.Pipeline
+import org.apache.beam.sdk.io.FileSystems
 import org.apache.beam.sdk.io.TextIO
-import org.apache.beam.sdk.io.gcp.spanner.SpannerConfig
 import org.apache.beam.sdk.io.gcp.spanner.SpannerIO
 import org.apache.beam.sdk.options.PipelineOptions
 import org.apache.beam.sdk.options.PipelineOptionsFactory
@@ -17,17 +15,17 @@ import org.apache.beam.sdk.transforms.Combine
 import org.apache.beam.sdk.transforms.DoFn
 import org.apache.beam.sdk.transforms.ParDo
 import org.apache.beam.sdk.values.KV
-import org.joda.time.Duration
+import org.slf4j.LoggerFactory
 import java.io.Serializable
 import java.time.Instant
 import java.util.zip.Inflater
 import java.util.zip.InflaterInputStream
 
-private val mapper: ObjectMapper = ObjectMapper()
-    .registerModules(KotlinModule(), JavaTimeModule())
-
+private val log = LoggerFactory.getLogger("uzaj")
 private val parser = Parser()
+private val mapper: ObjectMapper = ObjectMapper().registerModules(KotlinModule())
 
+// We currently don't need any options of our own
 interface Options : PipelineOptions
 
 data class Interests(
@@ -103,60 +101,60 @@ fun main(args: Array<String>) {
         )
         .withValidation()
         .`as`(Options::class.java)
-        .let { Pipeline.create(it) }
+        .let {
+            FileSystems.setDefaultPipelineOptions(it)
+            Pipeline.create(it)
+        }
         .also { pipeline ->
             pipeline
                 .apply(
                     SpannerIO.read()
                         .withBatching(true)
-                        .withSpannerConfig(
-                            SpannerConfig.create()
-                                .withCommitDeadline(Duration.standardHours(10))
-                        )
-                        .withPartitionOptions(
-                            PartitionOptions.newBuilder()
-                                .setMaxPartitions(256)
-                                .setPartitionSizeBytes(100 * 1024 * 1024)
-                                .build()
-                        )
                         .withInstanceId("prod")
                         .withDatabaseId("registry")
                         .withTable("documents")
                         // Putting the sha256 column in so the full primary is there, in case it helps sharding
                         .withColumns("graph_id", "sha256", "gzip")
                 )
-                .apply(ParDo.of(object : DoFn<Struct, KV<String, Interests>>() {
-                    @ProcessElement
-                    fun process(@Element element: Struct, out: OutputReceiver<KV<String, Interests>>) {
-                        element.getBytes(2)
-                            .asInputStream()
-                            .let { InflaterInputStream(it, Inflater(true)) }
-                            .bufferedReader()
-                            .use { buf ->
-                                try {
-                                    parser.parseDocument(buf).interests
-                                } catch (t: Throwable) {
-                                    null
-                                }?.let {
-                                    out.output(KV.of(element.getString(0), it))
+                .apply(
+                    ParDo.of(object : DoFn<Struct, KV<String, Interests>>() {
+                        @ProcessElement
+                        fun process(@Element element: Struct, out: OutputReceiver<KV<String, Interests>>) {
+                            element.getBytes(2)
+                                .asInputStream()
+                                .let { InflaterInputStream(it, Inflater(true)) }
+                                .bufferedReader()
+                                .use { buf ->
+                                    try {
+                                        out.output(
+                                            KV.of(
+                                                element.getString(0),
+                                                parser.parseDocument(buf).interests
+                                            )
+                                        )
+                                    } catch (t: Throwable) {
+                                        log.warn("Could not extract interests", t)
+                                    }
                                 }
-                            }
-                    }
-                }))
+                        }
+                    })
+                )
                 .apply(Combine.perKey(Interests.Combiner))
-                .apply(ParDo.of(object : DoFn<KV<String, Interests>, String>() {
-                    @ProcessElement
-                    fun process(@Element element: KV<String, Interests>, out: OutputReceiver<String>) {
-                        out.output(
-                            mapper.writeValueAsString(
-                                mapOf(
-                                    "graphID" to element.key,
-                                    "interests" to element.value,
+                .apply(
+                    ParDo.of(object : DoFn<KV<String, Interests>, String>() {
+                        @ProcessElement
+                        fun process(@Element element: KV<String, Interests>, out: OutputReceiver<String>) {
+                            out.output(
+                                mapper.writeValueAsString(
+                                    mapOf(
+                                        "graphID" to element.key,
+                                        "interests" to element.value
+                                    )
                                 )
                             )
-                        )
-                    }
-                }))
+                        }
+                    })
+                )
                 .apply(
                     TextIO
                         .write()
