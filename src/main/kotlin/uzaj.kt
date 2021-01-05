@@ -34,11 +34,6 @@ data class Interests(
     val directives: Set<String>,
     val directiveDefinitions: Set<String>
 ) : Serializable {
-    operator fun plus(other: Interests) = Interests(
-        directives = directives + other.directives,
-        directiveDefinitions = directiveDefinitions + other.directiveDefinitions
-    )
-
     object Combiner : Combine.CombineFn<Interests, Combiner.Acc, Interests>() {
         data class Acc(
             val directives: MutableSet<String> = mutableSetOf(),
@@ -101,6 +96,9 @@ fun main(args: Array<String>) {
             "--project=mdg-services",
             "--region=us-central1",
             "--workerMachineType=n1-standard-32",
+            "--numWorkers=4",
+            "--autoscalingAlgorithm=NONE",
+            "--enableStreamingEngine=true",
             *args
         )
         .withValidation()
