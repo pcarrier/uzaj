@@ -143,7 +143,7 @@ public class Uzaj4j {
                             }
                         })
                 )
-                .apply("Combine by graph", Combine.perKey(Interests.COMBINER))
+                //.apply("Combine by graph", Combine.perKey(Interests.COMBINER))
                 .apply("Serialize", MapElements.into(strings()).via((KV<String, Interests> kv) -> {
                     try {
                         return mapper.writeValueAsString(ImmutableMap.of(
