@@ -11,10 +11,10 @@ import org.apache.beam.sdk.io.TextIO
 import org.apache.beam.sdk.io.gcp.spanner.SpannerIO
 import org.apache.beam.sdk.options.PipelineOptions
 import org.apache.beam.sdk.options.PipelineOptionsFactory
-import org.apache.beam.sdk.transforms.Combine
-import org.apache.beam.sdk.transforms.DoFn
-import org.apache.beam.sdk.transforms.ParDo
+import org.apache.beam.sdk.transforms.*
 import org.apache.beam.sdk.values.KV
+import org.apache.beam.sdk.values.TypeDescriptor
+import org.apache.beam.sdk.values.TypeDescriptors
 import org.slf4j.LoggerFactory
 import java.io.Serializable
 import java.time.Instant
@@ -32,6 +32,10 @@ data class Interests(
     val directives: Set<String>,
     val directiveDefinitions: Set<String>
 ) : Serializable {
+    companion object {
+        val none = Interests(emptySet(), emptySet())
+    }
+
     object Combiner : Combine.CombineFn<Interests, Combiner.Acc, Interests>() {
         data class Acc(
             val directives: MutableSet<String> = mutableSetOf(),
@@ -118,26 +122,28 @@ fun main(args: Array<String>) {
                         .withColumns("graph_id", "sha256", "gzip")
                 )
                 .apply(
-                    ParDo.of(object : DoFn<Struct, KV<String, Interests>>() {
-                        @ProcessElement
-                        fun process(@Element element: Struct, out: OutputReceiver<KV<String, Interests>>) {
-                            element.getBytes(2)
-                                .asInputStream()
-                                .let { InflaterInputStream(it, Inflater(true)) }
-                                .bufferedReader()
-                                .use { buf ->
+                    MapElements.into(
+                        TypeDescriptors.kvs(
+                            TypeDescriptors.strings(),
+                            TypeDescriptor.of(Interests::class.java)
+                        )
+                    ).via(ProcessFunction<Struct, KV<String, Interests>> { input ->
+                        input.getBytes(2)
+                            .asInputStream()
+                            .let { InflaterInputStream(it, Inflater(true)) }
+                            .bufferedReader()
+                            .use { buf ->
+                                KV.of(
+                                    input.getString(0),
                                     try {
-                                        out.output(
-                                            KV.of(
-                                                element.getString(0),
-                                                parser.parseDocument(buf).interests
-                                            )
-                                        )
+                                        parser.parseDocument(buf).interests
                                     } catch (t: Throwable) {
-                                        log.warn("Could not extract interests", t)
+                                        Interests.none.also {
+                                            log.warn("Could not extract interests", t)
+                                        }
                                     }
-                                }
-                        }
+                                )
+                            }
                     })
                 )
                 .apply(Combine.perKey(Interests.Combiner))
