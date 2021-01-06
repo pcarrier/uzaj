@@ -16,7 +16,8 @@ import org.apache.beam.sdk.transforms.MapElements
 import org.apache.beam.sdk.transforms.ProcessFunction
 import org.apache.beam.sdk.values.KV
 import org.apache.beam.sdk.values.TypeDescriptor
-import org.apache.beam.sdk.values.TypeDescriptors
+import org.apache.beam.sdk.values.TypeDescriptors.kvs
+import org.apache.beam.sdk.values.TypeDescriptors.strings
 import org.slf4j.LoggerFactory
 import java.io.Serializable
 import java.time.Instant
@@ -93,18 +94,14 @@ private val Document.interests: Interests
         )
     }
 
-fun main(args: Array<String>) {
+fun main() {
     PipelineOptionsFactory
         .fromArgs(
             "--runner=DataflowRunner",
             "--project=mdg-services",
             "--region=us-central1",
-            "--workerMachineType=n1-standard-32",
-            "--numWorkers=4",
-            "--autoscalingAlgorithm=NONE",
-            "--enableStreamingEngine=true",
-            "--profilingAgentConfiguration={\"APICurated\":true}",
-            *args
+            "--workerMachineType=n1-standard-16",
+            "--profilingAgentConfiguration={\"APICurated\":true}"
         )
         .withValidation()
         .`as`(Options::class.java)
@@ -115,6 +112,7 @@ fun main(args: Array<String>) {
         .also { pipeline ->
             pipeline
                 .apply(
+                    "Read Spanner",
                     SpannerIO.read()
                         .withBatching(true)
                         .withInstanceId("prod")
@@ -124,33 +122,31 @@ fun main(args: Array<String>) {
                         .withColumns("graph_id", "sha256", "gzip")
                 )
                 .apply(
-                    MapElements.into(
-                        TypeDescriptors.kvs(
-                            TypeDescriptors.strings(),
-                            TypeDescriptor.of(Interests::class.java)
-                        )
-                    ).via(ProcessFunction<Struct, KV<String, Interests>> { input ->
-                        input.getBytes(2)
-                            .asInputStream()
-                            .let { InflaterInputStream(it, Inflater(true)) }
-                            .bufferedReader()
-                            .use { buf ->
-                                KV.of(
-                                    input.getString(0),
-                                    try {
-                                        parser.parseDocument(buf).interests
-                                    } catch (t: Throwable) {
-                                        Interests.none.also {
-                                            log.warn("Could not extract interests", t)
+                    "Extract GraphQL",
+                    MapElements.into(kvs(strings(), TypeDescriptor.of(Interests::class.java)))
+                        .via(ProcessFunction<Struct, KV<String, Interests>> { input ->
+                            input.getBytes(2)
+                                .asInputStream()
+                                .let { InflaterInputStream(it, Inflater(true)) }
+                                .bufferedReader()
+                                .use { buf ->
+                                    KV.of(
+                                        input.getString(0),
+                                        try {
+                                            parser.parseDocument(buf).interests
+                                        } catch (t: Throwable) {
+                                            Interests.none.also {
+                                                log.warn("Could not extract interests", t)
+                                            }
                                         }
-                                    }
-                                )
-                            }
-                    })
+                                    )
+                                }
+                        })
                 )
-                .apply(Combine.perKey(Interests.Combiner))
+                .apply("Combine by graph", Combine.perKey(Interests.Combiner))
                 .apply(
-                    MapElements.into(TypeDescriptors.strings()).via(
+                    "Serialize",
+                    MapElements.into(strings()).via(
                         ProcessFunction<KV<String, Interests>, String> { input ->
                             mapper.writeValueAsString(
                                 mapOf(
@@ -160,13 +156,14 @@ fun main(args: Array<String>) {
                             )
                         }
                     )
+
                 )
                 .apply(
-                    TextIO
-                        .write()
-                        .to("gs://mdg-pcarrier-tests/uzaj_${Instant.now().epochSecond}_")
+                    "Write to GCS",
+                    TextIO.write()
+                        .to("gs://mdg-pcarrier-tests/uzaj_${Instant.now().epochSecond}")
                         .withSuffix(".json")
-                        .withNumShards(64)
+                        .withNumShards(16)
                 )
         }
         .run()

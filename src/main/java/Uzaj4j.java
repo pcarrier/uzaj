@@ -18,17 +18,21 @@ import org.apache.beam.sdk.transforms.Combine;
 import org.apache.beam.sdk.transforms.MapElements;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.sdk.values.TypeDescriptors;
 import org.codehaus.jackson.annotate.JsonProperty;
 import org.codehaus.jackson.map.ObjectMapper;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.zip.Inflater;
 import java.util.zip.InflaterInputStream;
+
+import static org.apache.beam.sdk.values.TypeDescriptors.kvs;
+import static org.apache.beam.sdk.values.TypeDescriptors.strings;
 
 @lombok.extern.slf4j.Slf4j
 public class Uzaj4j {
@@ -46,10 +50,9 @@ public class Uzaj4j {
         static final Interests NONE = new Interests(ImmutableSet.of(), ImmutableSet.of());
 
         static Interests from(Document doc) {
-            final ImmutableSet.Builder<String> directives = ImmutableSet.<String>builder();
-            final ImmutableSet.Builder<String> directiveDefinitions = ImmutableSet.<String>builder();
+            final ImmutableSet.Builder<String> directives = ImmutableSet.builder();
+            final ImmutableSet.Builder<String> directiveDefinitions = ImmutableSet.builder();
             new LanguageTraversal().traverse(doc, new DocumentVisitor() {
-
                 @Override
                 public void enter(Node node, List<Node> path) {
                     if (node instanceof Directive) {
@@ -75,7 +78,7 @@ public class Uzaj4j {
 
                     @Override
                     public @NonNull Interests addInput(@NonNull Interests acc, @NonNull Interests input) {
-                        acc.directives.addAll(input.directives);
+                        Objects.requireNonNull(acc).directives.addAll(Objects.requireNonNull(input).directives);
                         acc.directiveDefinitions.addAll(input.directiveDefinitions);
                         return acc;
                     }
@@ -93,7 +96,7 @@ public class Uzaj4j {
                     @Override
                     public @NonNull Interests extractOutput(@NonNull Interests acc) {
                         return new Interests(
-                                ImmutableSet.copyOf(acc.directives),
+                                ImmutableSet.copyOf(Objects.requireNonNull(acc).directives),
                                 ImmutableSet.copyOf(acc.directiveDefinitions));
                     }
                 };
@@ -108,10 +111,7 @@ public class Uzaj4j {
                         "--runner=DataflowRunner",
                         "--project=mdg-services",
                         "--region=us-central1",
-                        "--workerMachineType=n1-standard-32",
-                        "--numWorkers=4",
-                        "--autoscalingAlgorithm=NONE",
-                        "--enableStreamingEngine=true",
+                        "--workerMachineType=n1-standard-16",
                         "--profilingAgentConfiguration={\"APICurated\":true}"
                 )
                 .withValidation()
@@ -120,7 +120,7 @@ public class Uzaj4j {
         final Pipeline pipeline = Pipeline.create(options);
 
         pipeline
-                .apply(SpannerIO.read()
+                .apply("Read Spanner", SpannerIO.read()
                         .withBatching(true)
                         .withInstanceId("prod")
                         .withDatabaseId("registry")
@@ -128,13 +128,13 @@ public class Uzaj4j {
                         // Putting the sha256 column in so the full primary is there, in case it helps sharding
                         .withColumns("graph_id", "sha256", "gzip")
                 )
-                .apply(MapElements.into(TypeDescriptors.kvs(
-                        TypeDescriptors.strings(),
+                .apply("Extract GraphQL", MapElements.into(kvs(
+                        strings(),
                         TypeDescriptor.of(Interests.class))).via((Struct input) -> {
-                            final String graphID = input.getString(0);
+                            final String graphID = Objects.requireNonNull(input).getString(0);
                             try (final InputStream compressed = input.getBytes(2).asInputStream();
-                                 final InflaterInputStream bytes = new InflaterInputStream(compressed);
-                                 final InputStreamReader text = new InputStreamReader(bytes);
+                                 final InflaterInputStream bytes = new InflaterInputStream(compressed, new Inflater(true));
+                                 final InputStreamReader text = new InputStreamReader(bytes, StandardCharsets.UTF_8);
                                  final BufferedReader buffered = new BufferedReader(text)) {
                                 return KV.of(graphID, Interests.from(parser.parseDocument(buffered)));
                             } catch (Throwable t) {
@@ -143,22 +143,21 @@ public class Uzaj4j {
                             }
                         })
                 )
-                .apply(Combine.perKey(Interests.COMBINER))
-                .apply(MapElements.into(TypeDescriptors.strings()).via((KV<String, Interests> kv) -> {
+                .apply("Combine by graph", Combine.perKey(Interests.COMBINER))
+                .apply("Serialize", MapElements.into(strings()).via((KV<String, Interests> kv) -> {
                     try {
                         return mapper.writeValueAsString(ImmutableMap.of(
-                                "graphID", Objects.requireNonNull(kv.getKey()),
+                                "graphID", Objects.requireNonNull(Objects.requireNonNull(kv).getKey()),
                                 "interests", Objects.requireNonNull(kv.getValue())
                         ));
                     } catch (IOException e) {
                         throw new RuntimeException("Could not serialize", e);
                     }
                 }))
-                .apply(TextIO
-                        .write()
+                .apply("Write to GCS", TextIO.write()
                         .to("gs://mdg-pcarrier-tests/uzaj4j_" + Instant.now().getEpochSecond())
                         .withSuffix(".json")
-                        .withNumShards(64));
+                        .withNumShards(16));
 
         pipeline.run().waitUntilFinish();
     }
