@@ -97,6 +97,7 @@ fun main(args: Array<String>) {
             "--numWorkers=4",
             "--autoscalingAlgorithm=NONE",
             "--enableStreamingEngine=true",
+            "--profilingAgentConfiguration={\"APICurated\":true}",
             *args
         )
         .withValidation()
