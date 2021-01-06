@@ -36,7 +36,6 @@ import static org.apache.beam.sdk.values.TypeDescriptors.strings;
 
 @lombok.extern.slf4j.Slf4j
 public class Uzaj4j {
-    // We currently don't need any options of our own
     public interface Options extends PipelineOptions {
     }
 
@@ -114,53 +113,49 @@ public class Uzaj4j {
                         "--workerMachineType=n1-standard-4",
                         "--numWorkers=32",
                         "--autoscalingAlgorithm=NONE",
-                        "--profilingAgentConfiguration={\"APICurated\":true}"
-                )
+                        "--profilingAgentConfiguration={\"APICurated\":true}")
                 .withValidation()
                 .as(Options.class);
         FileSystems.setDefaultPipelineOptions(options);
         final Pipeline pipeline = Pipeline.create(options);
-
         pipeline
                 .apply("Read Spanner", SpannerIO.read()
                         .withBatching(true)
                         .withInstanceId("prod")
                         .withDatabaseId("registry")
                         .withTable("documents")
-                        // Putting the sha256 column in so the full primary is there, in case it helps sharding
-                        .withColumns("graph_id", "sha256", "gzip")
-                )
-                .apply("Extract GraphQL", MapElements.into(kvs(
-                        strings(),
-                        TypeDescriptor.of(Interests.class))).via((Struct input) -> {
+                        .withColumns("graph_id", "gzip"))
+                .apply("Extract GraphQL", MapElements
+                        .into(kvs(strings(), TypeDescriptor.of(Interests.class)))
+                        .via((Struct input) -> {
                             final String graphID = Objects.requireNonNull(input).getString(0);
-                            try (final InputStream compressed = input.getBytes(2).asInputStream();
+                            try (final InputStream compressed = input.getBytes(1).asInputStream();
                                  final InflaterInputStream bytes = new InflaterInputStream(compressed, new Inflater(true));
                                  final InputStreamReader text = new InputStreamReader(bytes, StandardCharsets.UTF_8);
-                                 final BufferedReader buffered = new BufferedReader(text)) {
-                                return KV.of(graphID, Interests.from(parser.parseDocument(buffered)));
+                                 final BufferedReader buff = new BufferedReader(text)) {
+                                return KV.of(graphID, Interests.from(parser.parseDocument(buff)));
                             } catch (Throwable t) {
                                 log.warn("Could not extract interests", t);
                                 return KV.of(graphID, Interests.NONE);
                             }
-                        })
-                )
+                        }))
                 .apply("Combine by graph", Combine.perKey(Interests.COMBINER))
-                .apply("Serialize", MapElements.into(strings()).via((KV<String, Interests> kv) -> {
-                    try {
-                        return mapper.writeValueAsString(ImmutableMap.of(
-                                "graphID", Objects.requireNonNull(Objects.requireNonNull(kv).getKey()),
-                                "interests", Objects.requireNonNull(kv.getValue())
-                        ));
-                    } catch (IOException e) {
-                        throw new RuntimeException("Could not serialize", e);
-                    }
-                }))
+                .apply("Serialize", MapElements
+                        .into(strings())
+                        .via((KV<String, Interests> kv) -> {
+                            try {
+                                return mapper.writeValueAsString(ImmutableMap.of(
+                                        "graphID", Objects.requireNonNull(Objects.requireNonNull(kv).getKey()),
+                                        "interests", Objects.requireNonNull(kv.getValue())
+                                ));
+                            } catch (IOException e) {
+                                throw new RuntimeException("Could not serialize", e);
+                            }
+                        }))
                 .apply("Write to GCS", TextIO.write()
                         .to("gs://mdg-pcarrier-tests/uzaj4j_" + Instant.now().getEpochSecond())
                         .withSuffix(".json")
                         .withNumShards(16));
-
         pipeline.run().waitUntilFinish();
     }
 }

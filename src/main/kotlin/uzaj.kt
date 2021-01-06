@@ -28,7 +28,6 @@ private val log = LoggerFactory.getLogger("uzaj")
 private val parser = Parser()
 private val mapper: ObjectMapper = ObjectMapper().registerModules(KotlinModule())
 
-// We currently don't need any options of our own
 interface Options : PipelineOptions
 
 data class Interests(
@@ -39,29 +38,26 @@ data class Interests(
         val none = Interests(emptySet(), emptySet())
     }
 
-    object Combiner : Combine.CombineFn<Interests, Combiner.Acc, Interests>() {
+    internal object Combiner : Combine.CombineFn<Interests, Combiner.Acc, Interests>() {
         data class Acc(
             val directives: MutableSet<String> = mutableSetOf(),
             val directiveDefinitions: MutableSet<String> = mutableSetOf()
-        ) : Serializable {
-            operator fun plusAssign(input: Acc) {
-                directives += input.directives
-                directiveDefinitions += input.directiveDefinitions
-            }
-
-            operator fun plusAssign(input: Interests) {
-                directives += input.directives
-                directiveDefinitions += input.directiveDefinitions
-            }
-        }
+        ) : Serializable
 
         override fun createAccumulator(): Acc = Acc()
-        override fun addInput(acc: Acc, input: Interests) = acc.also { it += input }
+        override fun addInput(acc: Acc, input: Interests) = acc.also {
+            it.directives += input.directives
+            it.directiveDefinitions += input.directiveDefinitions
+        }
 
         override fun mergeAccumulators(accumulators: MutableIterable<Acc>): Acc =
             accumulators.iterator().let { itr ->
                 itr.next().also { first ->
-                    while (itr.hasNext()) first += itr.next()
+                    while (itr.hasNext()) {
+                        val input = itr.next()
+                        first.directives += input.directives
+                        first.directiveDefinitions += input.directiveDefinitions
+                    }
                 }
             }
 
@@ -81,8 +77,6 @@ private val Document.interests: Interests
                 when (node) {
                     is Directive -> directives += AstPrinter.printAstCompact(node)
                     is DirectiveDefinition -> directiveDefinitions += AstPrinter.printAstCompact(node)
-                    else -> {
-                    }
                 }
             }
 
@@ -114,55 +108,45 @@ fun main() {
         .also { pipeline ->
             pipeline
                 .apply(
-                    "Read Spanner",
-                    SpannerIO.read()
+                    "Read Spanner", SpannerIO.read()
                         .withBatching(true)
                         .withInstanceId("prod")
                         .withDatabaseId("registry")
                         .withTable("documents")
-                        // Putting the sha256 column in so the full primary is there, in case it helps sharding
-                        .withColumns("graph_id", "sha256", "gzip")
+                        .withColumns("graph_id", "gzip")
                 )
                 .apply(
-                    "Extract GraphQL",
-                    MapElements.into(kvs(strings(), TypeDescriptor.of(Interests::class.java)))
+                    "Extract GraphQL", MapElements
+                        .into(kvs(strings(), TypeDescriptor.of(Interests::class.java)))
                         .via(ProcessFunction<Struct, KV<String, Interests>> { input ->
-                            input.getBytes(2)
+                            input.getBytes(1)
                                 .asInputStream()
                                 .let { InflaterInputStream(it, Inflater(true)) }
                                 .bufferedReader()
-                                .use { buf ->
-                                    KV.of(
-                                        input.getString(0),
-                                        try {
-                                            parser.parseDocument(buf).interests
-                                        } catch (t: Throwable) {
-                                            Interests.none.also {
-                                                log.warn("Could not extract interests", t)
-                                            }
-                                        }
-                                    )
+                                .use { buff ->
+                                    try {
+                                        parser.parseDocument(buff).interests
+                                    } catch (t: Throwable) {
+                                        Interests.none.also { log.warn("Could not extract interests", t) }
+                                    }.let { interests ->
+                                        KV.of(input.getString(0), interests)
+                                    }
                                 }
                         })
                 )
                 .apply("Combine by graph", Combine.perKey(Interests.Combiner))
                 .apply(
-                    "Serialize",
-                    MapElements.into(strings()).via(
-                        ProcessFunction<KV<String, Interests>, String> { input ->
-                            mapper.writeValueAsString(
-                                mapOf(
-                                    "graphID" to input.key,
-                                    "interests" to input.value
-                                )
-                            )
-                        }
-                    )
-
+                    "Serialize", MapElements
+                        .into(strings())
+                        .via(ProcessFunction<KV<String, Interests>, String> { input ->
+                            mapOf(
+                                "graphID" to input.key,
+                                "interests" to input.value
+                            ).let { mapper.writeValueAsString(it) }
+                        })
                 )
                 .apply(
-                    "Write to GCS",
-                    TextIO.write()
+                    "Write to GCS", TextIO.write()
                         .to("gs://mdg-pcarrier-tests/uzaj_${Instant.now().epochSecond}")
                         .withSuffix(".json")
                         .withNumShards(16)
