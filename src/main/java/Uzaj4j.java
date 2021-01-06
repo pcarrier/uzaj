@@ -111,7 +111,9 @@ public class Uzaj4j {
                         "--runner=DataflowRunner",
                         "--project=mdg-services",
                         "--region=us-central1",
-                        "--workerMachineType=n1-standard-16",
+                        "--workerMachineType=n1-standard-4",
+                        "--numWorkers=32",
+                        "--autoscalingAlgorithm=NONE",
                         "--profilingAgentConfiguration={\"APICurated\":true}"
                 )
                 .withValidation()
