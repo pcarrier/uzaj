@@ -11,7 +11,9 @@ import org.apache.beam.sdk.io.TextIO
 import org.apache.beam.sdk.io.gcp.spanner.SpannerIO
 import org.apache.beam.sdk.options.PipelineOptions
 import org.apache.beam.sdk.options.PipelineOptionsFactory
-import org.apache.beam.sdk.transforms.*
+import org.apache.beam.sdk.transforms.Combine
+import org.apache.beam.sdk.transforms.MapElements
+import org.apache.beam.sdk.transforms.ProcessFunction
 import org.apache.beam.sdk.values.KV
 import org.apache.beam.sdk.values.TypeDescriptor
 import org.apache.beam.sdk.values.TypeDescriptors
@@ -148,19 +150,16 @@ fun main(args: Array<String>) {
                 )
                 .apply(Combine.perKey(Interests.Combiner))
                 .apply(
-                    ParDo.of(object : DoFn<KV<String, Interests>, String>() {
-                        @ProcessElement
-                        fun process(@Element element: KV<String, Interests>, out: OutputReceiver<String>) {
-                            out.output(
-                                mapper.writeValueAsString(
-                                    mapOf(
-                                        "graphID" to element.key,
-                                        "interests" to element.value
-                                    )
+                    MapElements.into(TypeDescriptors.strings()).via(
+                        ProcessFunction<KV<String, Interests>, String> { input ->
+                            mapper.writeValueAsString(
+                                mapOf(
+                                    "graphID" to input.key,
+                                    "interests" to input.value
                                 )
                             )
                         }
-                    })
+                    )
                 )
                 .apply(
                     TextIO
