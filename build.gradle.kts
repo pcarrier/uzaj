@@ -1,5 +1,7 @@
 plugins {
+  id("io.freefair.lombok").version("5.3.0")
   kotlin("jvm").version("1.4.21")
+  java
 }
 
 repositories {
