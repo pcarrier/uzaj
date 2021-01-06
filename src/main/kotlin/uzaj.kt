@@ -143,7 +143,7 @@ fun main() {
                                 }
                         })
                 )
-                //.apply("Combine by graph", Combine.perKey(Interests.Combiner))
+                .apply("Combine by graph", Combine.perKey(Interests.Combiner))
                 .apply(
                     "Serialize",
                     MapElements.into(strings()).via(
