@@ -128,27 +128,27 @@ public class Uzaj4j {
                         // Putting the sha256 column in so the full primary is there, in case it helps sharding
                         .withColumns("graph_id", "sha256", "gzip")
                 )
-                .apply("Extract GraphQL", MapElements.into(kvs(
-                        strings(),
-                        TypeDescriptor.of(Interests.class))).via((Struct input) -> {
-                            final String graphID = Objects.requireNonNull(input).getString(0);
-                            try (final InputStream compressed = input.getBytes(2).asInputStream();
-                                 final InflaterInputStream bytes = new InflaterInputStream(compressed, new Inflater(true));
-                                 final InputStreamReader text = new InputStreamReader(bytes, StandardCharsets.UTF_8);
-                                 final BufferedReader buffered = new BufferedReader(text)) {
-                                return KV.of(graphID, Interests.from(parser.parseDocument(buffered)));
-                            } catch (Throwable t) {
-                                log.warn("Could not extract interests", t);
-                                return KV.of(graphID, Interests.NONE);
-                            }
-                        })
-                )
-                //.apply("Combine by graph", Combine.perKey(Interests.COMBINER))
-                .apply("Serialize", MapElements.into(strings()).via((KV<String, Interests> kv) -> {
+//                .apply("Extract GraphQL", MapElements.into(kvs(
+//                        strings(),
+//                        TypeDescriptor.of(Interests.class))).via((Struct input) -> {
+//                            final String graphID = Objects.requireNonNull(input).getString(0);
+//                            try (final InputStream compressed = input.getBytes(2).asInputStream();
+//                                 final InflaterInputStream bytes = new InflaterInputStream(compressed, new Inflater(true));
+//                                 final InputStreamReader text = new InputStreamReader(bytes, StandardCharsets.UTF_8);
+//                                 final BufferedReader buffered = new BufferedReader(text)) {
+//                                return KV.of(graphID, Interests.from(parser.parseDocument(buffered)));
+//                            } catch (Throwable t) {
+//                                log.warn("Could not extract interests", t);
+//                                return KV.of(graphID, Interests.NONE);
+//                            }
+//                        })
+//                )
+//                .apply("Combine by graph", Combine.perKey(Interests.COMBINER))
+                .apply("Serialize", MapElements.into(strings()).via((Struct struct) -> {
                     try {
                         return mapper.writeValueAsString(ImmutableMap.of(
-                                "graphID", Objects.requireNonNull(Objects.requireNonNull(kv).getKey()),
-                                "interests", Objects.requireNonNull(kv.getValue())
+                                "graphID", struct.getString(0),
+                                "doc", struct.getBytes(2).toBase64()
                         ));
                     } catch (IOException e) {
                         throw new RuntimeException("Could not serialize", e);
