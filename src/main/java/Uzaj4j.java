@@ -101,7 +101,6 @@ public class Uzaj4j {
                 };
     }
 
-    private final static Parser parser = new Parser();
     private final static ObjectMapper mapper = new ObjectMapper();
 
     public static void main(String... args) {
@@ -110,7 +109,7 @@ public class Uzaj4j {
                         "--runner=DataflowRunner",
                         "--project=mdg-services",
                         "--region=us-central1",
-                        "--workerMachineType=n1-standard-4",
+                        "--workerMachineType=n1-standard-32",
                         "--numWorkers=32",
                         "--autoscalingAlgorithm=NONE",
                         "--profilingAgentConfiguration={\"APICurated\":true}")
@@ -133,7 +132,7 @@ public class Uzaj4j {
                                  final InflaterInputStream bytes = new InflaterInputStream(compressed, new Inflater(true));
                                  final InputStreamReader text = new InputStreamReader(bytes, StandardCharsets.UTF_8);
                                  final BufferedReader buff = new BufferedReader(text)) {
-                                return KV.of(graphID, Interests.from(parser.parseDocument(buff)));
+                                return KV.of(graphID, Interests.from(new Parser().parseDocument(buff)));
                             } catch (Throwable t) {
                                 log.warn("Could not extract interests", t);
                                 return KV.of(graphID, Interests.NONE);
