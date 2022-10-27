@@ -21,33 +21,44 @@ import org.apache.beam.sdk.values.TypeDescriptors.strings
 import org.slf4j.LoggerFactory
 import java.io.Serializable
 import java.time.Instant
-import java.util.zip.Inflater
 import java.util.zip.InflaterInputStream
 
+private val workers = 3
+private val shards = 8
 private val log = LoggerFactory.getLogger("uzaj")
-private val parser = Parser()
-private val mapper: ObjectMapper = ObjectMapper().registerModules(KotlinModule())
+internal val parser = Parser()
+private val mapper: ObjectMapper = ObjectMapper().registerModules(
+    KotlinModule.Builder().build()
+)
 
 interface Options : PipelineOptions
 
 data class Interests(
     val directives: Set<String>,
-    val directiveDefinitions: Set<String>
+    val directiveDefinitions: Set<String>,
+    val failed: Boolean,
 ) : Serializable {
     companion object {
-        val none = Interests(emptySet(), emptySet())
+        val failed = Interests(emptySet(), emptySet(), true)
+        private const val serialVersionUID = 1L
     }
 
     internal object Combiner : Combine.CombineFn<Interests, Combiner.Acc, Interests>() {
         data class Acc(
             val directives: MutableSet<String> = mutableSetOf(),
-            val directiveDefinitions: MutableSet<String> = mutableSetOf()
-        ) : Serializable
+            val directiveDefinitions: MutableSet<String> = mutableSetOf(),
+            var failed: Boolean = false,
+        ) : Serializable {
+            companion object {
+                private const val serialVersionUID = 1L
+            }
+        }
 
         override fun createAccumulator(): Acc = Acc()
         override fun addInput(acc: Acc, input: Interests) = acc.also {
             it.directives += input.directives
             it.directiveDefinitions += input.directiveDefinitions
+            it.failed = it.failed || input.failed
         }
 
         override fun mergeAccumulators(accumulators: MutableIterable<Acc>): Acc =
@@ -57,6 +68,7 @@ data class Interests(
                         val input = itr.next()
                         first.directives += input.directives
                         first.directiveDefinitions += input.directiveDefinitions
+                        first.failed = first.failed || input.failed
                     }
                 }
             }
@@ -64,11 +76,12 @@ data class Interests(
         override fun extractOutput(acc: Acc) = Interests(
             directives = acc.directives,
             directiveDefinitions = acc.directiveDefinitions,
+            failed = acc.failed,
         )
     }
 }
 
-private val Document.interests: Interests
+internal val Document.interests: Interests
     get() {
         val directives = mutableSetOf<String>()
         val directiveDefinitions = mutableSetOf<String>()
@@ -84,7 +97,8 @@ private val Document.interests: Interests
         })
         return Interests(
             directives = directives,
-            directiveDefinitions = directiveDefinitions
+            directiveDefinitions = directiveDefinitions,
+            failed = false,
         )
     }
 
@@ -92,12 +106,11 @@ fun main() {
     PipelineOptionsFactory
         .fromArgs(
             "--runner=DataflowRunner",
+            "--numWorkers=$workers",
             "--project=mdg-services",
             "--region=us-central1",
-            "--workerMachineType=n1-standard-4",
-            "--numWorkers=32",
-            "--autoscalingAlgorithm=NONE",
-            "--profilingAgentConfiguration={\"APICurated\":true}"
+            "--workerMachineType=e2-standard-16",
+            "--gcpTempLocation=gs://mdg-pcarrier-tests/uzaj/tmp",
         )
         .withValidation()
         .`as`(Options::class.java)
@@ -111,7 +124,7 @@ fun main() {
                     "Read Spanner", SpannerIO.read()
                         .withBatching(true)
                         .withInstanceId("prod")
-                        .withDatabaseId("registry")
+                        .withDatabaseId("signatures")
                         .withTable("documents")
                         .withColumns("graph_id", "gzip")
                 )
@@ -121,20 +134,22 @@ fun main() {
                         .via(ProcessFunction<Struct, KV<String, Interests>> { input ->
                             input.getBytes(1)
                                 .asInputStream()
-                                .let { InflaterInputStream(it, Inflater(true)) }
+                                .let { InflaterInputStream(it) }
                                 .bufferedReader()
                                 .use { buff ->
                                     try {
                                         parser.parseDocument(buff).interests
                                     } catch (t: Throwable) {
-                                        Interests.none.also { log.warn("Could not extract interests", t) }
+                                        Interests.failed.also { log.warn("Could not extract interests", t) }
                                     }.let { interests ->
                                         KV.of(input.getString(0), interests)
                                     }
                                 }
                         })
                 )
-                .apply("Combine by graph", Combine.perKey(Interests.Combiner))
+                .apply(
+                    "Combine by graph", Combine.perKey(Interests.Combiner)
+                )
                 .apply(
                     "Serialize", MapElements
                         .into(strings())
@@ -147,9 +162,9 @@ fun main() {
                 )
                 .apply(
                     "Write to GCS", TextIO.write()
-                        .to("gs://mdg-pcarrier-tests/uzaj_${Instant.now().epochSecond}")
+                        .to("gs://mdg-pcarrier-tests/uzaj/results/${Instant.now().epochSecond}/result")
                         .withSuffix(".json")
-                        .withNumShards(16)
+                        .withNumShards(shards)
                 )
         }
         .run()
