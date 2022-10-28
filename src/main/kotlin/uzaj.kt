@@ -105,6 +105,7 @@ internal val Document.interests: Interests
 fun main() {
     PipelineOptionsFactory
         .fromArgs(
+            "--experiments=use_runner_v2",
             "--runner=DataflowRunner",
             "--numWorkers=$workers",
             "--project=mdg-services",
