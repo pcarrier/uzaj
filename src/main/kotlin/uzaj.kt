@@ -1,5 +1,6 @@
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.KotlinModule
+import com.google.cloud.spanner.PartitionOptions
 import com.google.cloud.spanner.Struct
 import graphql.language.*
 import graphql.parser.Parser
@@ -18,28 +19,25 @@ import org.apache.beam.sdk.values.KV
 import org.apache.beam.sdk.values.TypeDescriptor
 import org.apache.beam.sdk.values.TypeDescriptors.kvs
 import org.apache.beam.sdk.values.TypeDescriptors.strings
-import org.slf4j.LoggerFactory
 import java.io.Serializable
 import java.time.Instant
 import java.util.zip.InflaterInputStream
 
-private val workers = 3
-private val shards = 8
-private val log = LoggerFactory.getLogger("uzaj")
-internal val parser = Parser()
-private val mapper: ObjectMapper = ObjectMapper().registerModules(
-    KotlinModule.Builder().build()
-)
+private const val workers = 3
+private const val readPartitions = 64L
+private const val writePartitions = 64
+private val mapper: ObjectMapper = ObjectMapper()
+    .registerModules(KotlinModule.Builder().build())
 
 interface Options : PipelineOptions
 
 data class Interests(
     val directives: Set<String>,
     val directiveDefinitions: Set<String>,
-    val failed: Boolean,
+    val failed: Int,
 ) : Serializable {
     companion object {
-        val failed = Interests(emptySet(), emptySet(), true)
+        val failed = Interests(emptySet(), emptySet(), 1)
         private const val serialVersionUID = 1L
     }
 
@@ -47,7 +45,7 @@ data class Interests(
         data class Acc(
             val directives: MutableSet<String> = mutableSetOf(),
             val directiveDefinitions: MutableSet<String> = mutableSetOf(),
-            var failed: Boolean = false,
+            var failed: Int = 0,
         ) : Serializable {
             companion object {
                 private const val serialVersionUID = 1L
@@ -58,7 +56,7 @@ data class Interests(
         override fun addInput(acc: Acc, input: Interests) = acc.also {
             it.directives += input.directives
             it.directiveDefinitions += input.directiveDefinitions
-            it.failed = it.failed || input.failed
+            it.failed += input.failed
         }
 
         override fun mergeAccumulators(accumulators: MutableIterable<Acc>): Acc =
@@ -68,7 +66,7 @@ data class Interests(
                         val input = itr.next()
                         first.directives += input.directives
                         first.directiveDefinitions += input.directiveDefinitions
-                        first.failed = first.failed || input.failed
+                        first.failed += input.failed
                     }
                 }
             }
@@ -98,7 +96,7 @@ internal val Document.interests: Interests
         return Interests(
             directives = directives,
             directiveDefinitions = directiveDefinitions,
-            failed = false,
+            failed = 0,
         )
     }
 
@@ -107,10 +105,11 @@ fun main() {
         .fromArgs(
             "--experiments=use_runner_v2",
             "--runner=DataflowRunner",
-            "--numWorkers=$workers",
             "--project=mdg-services",
             "--region=us-central1",
             "--workerMachineType=e2-standard-16",
+            "--numWorkers=$workers",
+            "--autoscalingAlgorithm=NONE",
             "--gcpTempLocation=gs://mdg-pcarrier-tests/uzaj/tmp",
         )
         .withValidation()
@@ -122,30 +121,28 @@ fun main() {
         .also { pipeline ->
             pipeline
                 .apply(
-                    "Read Spanner", SpannerIO.read()
+                    "Read Spanner", SpannerIO
+                        .read()
                         .withBatching(true)
                         .withInstanceId("prod")
                         .withDatabaseId("signatures")
                         .withTable("documents")
                         .withColumns("graph_id", "gzip")
+                        .withPartitionOptions(PartitionOptions.newBuilder()
+                            .setMaxPartitions(readPartitions)
+                            .build())
                 )
                 .apply(
                     "Extract GraphQL", MapElements
                         .into(kvs(strings(), TypeDescriptor.of(Interests::class.java)))
                         .via(ProcessFunction<Struct, KV<String, Interests>> { input ->
-                            input.getBytes(1)
+                            val gql = input.getBytes(1)
                                 .asInputStream()
                                 .let { InflaterInputStream(it) }
                                 .bufferedReader()
-                                .use { buff ->
-                                    try {
-                                        parser.parseDocument(buff).interests
-                                    } catch (t: Throwable) {
-                                        Interests.failed.also { log.warn("Could not extract interests", t) }
-                                    }.let { interests ->
-                                        KV.of(input.getString(0), interests)
-                                    }
-                                }
+                                .readText()
+                            val interests = Parser.parse(gql).interests
+                            KV.of(input.getString(0), interests)
                         })
                 )
                 .apply(
@@ -165,7 +162,7 @@ fun main() {
                     "Write to GCS", TextIO.write()
                         .to("gs://mdg-pcarrier-tests/uzaj/results/${Instant.now().epochSecond}/result")
                         .withSuffix(".json")
-                        .withNumShards(shards)
+                        .withNumShards(writePartitions)
                 )
         }
         .run()
