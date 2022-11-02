@@ -1,15 +1,15 @@
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.KotlinModule
-import com.google.cloud.spanner.PartitionOptions
-import com.google.cloud.spanner.Struct
 import graphql.language.*
 import graphql.parser.Parser
 import graphql.validation.DocumentVisitor
 import graphql.validation.LanguageTraversal
+import org.apache.avro.generic.GenericRecord
+import org.apache.avro.util.Utf8
 import org.apache.beam.sdk.Pipeline
+import org.apache.beam.sdk.io.AvroIO
 import org.apache.beam.sdk.io.FileSystems
 import org.apache.beam.sdk.io.TextIO
-import org.apache.beam.sdk.io.gcp.spanner.SpannerIO
 import org.apache.beam.sdk.options.PipelineOptions
 import org.apache.beam.sdk.options.PipelineOptionsFactory
 import org.apache.beam.sdk.transforms.Combine
@@ -23,8 +23,6 @@ import java.io.Serializable
 import java.time.Instant
 import java.util.zip.InflaterInputStream
 
-private const val workers = 3
-private const val readPartitions = 64L
 private const val writePartitions = 64
 private val mapper: ObjectMapper = ObjectMapper()
     .registerModules(KotlinModule.Builder().build())
@@ -100,16 +98,17 @@ internal val Document.interests: Interests
         )
     }
 
+data class Entry(val graphID: String, val gzip: ByteArray) : Serializable
+
 fun main() {
     PipelineOptionsFactory
         .fromArgs(
+            "--runner=direct",
+            // "--runner=DataflowRunner",
             "--experiments=use_runner_v2",
-            "--runner=DataflowRunner",
             "--project=mdg-services",
             "--region=us-central1",
             "--workerMachineType=e2-standard-16",
-            "--numWorkers=$workers",
-            "--autoscalingAlgorithm=NONE",
             "--gcpTempLocation=gs://mdg-pcarrier-tests/uzaj/tmp",
         )
         .withValidation()
@@ -121,28 +120,25 @@ fun main() {
         .also { pipeline ->
             pipeline
                 .apply(
-                    "Read Spanner", SpannerIO
-                        .read()
-                        .withBatching(true)
-                        .withInstanceId("prod")
-                        .withDatabaseId("signatures")
-                        .withTable("documents")
-                        .withColumns("graph_id", "gzip")
-                        .withPartitionOptions(PartitionOptions.newBuilder()
-                            .setMaxPartitions(readPartitions)
-                            .build())
+                    "Read GCS", AvroIO
+                        .readGenericRecords("{\"type\":\"record\",\"name\":\"documents\",\"namespace\":\"spannerexport\",\"fields\":[{\"name\":\"graph_id\",\"type\":\"string\",\"sqlType\":\"STRING(64)\"},{\"name\":\"sha1\",\"type\":\"bytes\",\"sqlType\":\"BYTES(20)\"},{\"name\":\"gzip\",\"type\":\"bytes\",\"sqlType\":\"BYTES(MAX)\"},{\"name\":\"name\",\"type\":[\"null\",\"string\"],\"sqlType\":\"STRING(MAX)\"},{\"name\":\"upserted_at\",\"type\":\"string\",\"sqlType\":\"TIMESTAMP\",\"spannerOption_0\":\"allow_commit_timestamp=TRUE\"},{\"name\":\"truncated\",\"type\":\"boolean\",\"sqlType\":\"BOOL\"}],\"googleStorage\":\"CloudSpanner\",\"spannerPrimaryKey\":\"`graph_id` ASC,`sha1` ASC\",\"spannerPrimaryKey_0\":\"`graph_id` ASC\",\"spannerPrimaryKey_1\":\"`sha1` ASC\",\"googleFormatVersion\":\"1.0.0\"}")
+                        .from("gs://mdg-pcarrier-tests/prod-signatures-2022-11-01_11_28_17-8424568496955305491/documents.avro-*")
                 )
                 .apply(
-                    "Extract GraphQL", MapElements
+                    "Extract directives & their definitions", MapElements
                         .into(kvs(strings(), TypeDescriptor.of(Interests::class.java)))
-                        .via(ProcessFunction<Struct, KV<String, Interests>> { input ->
-                            val gql = input.getBytes(1)
-                                .asInputStream()
-                                .let { InflaterInputStream(it) }
-                                .bufferedReader()
-                                .readText()
-                            val interests = Parser.parse(gql).interests
-                            KV.of(input.getString(0), interests)
+                        .via(ProcessFunction<GenericRecord, KV<String, Interests>> { input ->
+                            KV.of(
+                                (input.get("graph_id") as Utf8).toString(),
+                                try {
+                                    Parser.parse((input.get("gzip") as ByteArray)
+                                        .inputStream()
+                                        .let { InflaterInputStream(it) }
+                                        .bufferedReader()
+                                        .readText()).interests
+                                } catch (t: Throwable) {
+                                    Interests.failed
+                                })
                         })
                 )
                 .apply(
