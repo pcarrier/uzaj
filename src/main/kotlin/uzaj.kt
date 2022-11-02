@@ -19,11 +19,15 @@ import org.apache.beam.sdk.values.KV
 import org.apache.beam.sdk.values.TypeDescriptor
 import org.apache.beam.sdk.values.TypeDescriptors.kvs
 import org.apache.beam.sdk.values.TypeDescriptors.strings
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 import java.io.Serializable
+import java.nio.ByteBuffer
 import java.time.Instant
 import java.util.zip.InflaterInputStream
 
 private const val writePartitions = 64
+private val log: Logger = LoggerFactory.getLogger("uzaj")
 private val mapper: ObjectMapper = ObjectMapper()
     .registerModules(KotlinModule.Builder().build())
 
@@ -103,8 +107,7 @@ data class Entry(val graphID: String, val gzip: ByteArray) : Serializable
 fun main() {
     PipelineOptionsFactory
         .fromArgs(
-            "--runner=direct",
-            // "--runner=DataflowRunner",
+            "--runner=DataflowRunner",
             "--experiments=use_runner_v2",
             "--project=mdg-services",
             "--region=us-central1",
@@ -131,12 +134,16 @@ fun main() {
                             KV.of(
                                 (input.get("graph_id") as Utf8).toString(),
                                 try {
-                                    Parser.parse((input.get("gzip") as ByteArray)
-                                        .inputStream()
-                                        .let { InflaterInputStream(it) }
-                                        .bufferedReader()
-                                        .readText()).interests
+                                    Parser.parse(
+                                        (input.get("gzip") as ByteBuffer)
+                                            .array()
+                                            .inputStream()
+                                            .let { InflaterInputStream(it) }
+                                            .bufferedReader()
+                                            .readText()
+                                    ).interests
                                 } catch (t: Throwable) {
+                                    log.error("Extraction failed", t)
                                     Interests.failed
                                 })
                         })
